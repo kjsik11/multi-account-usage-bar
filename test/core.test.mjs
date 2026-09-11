@@ -833,3 +833,176 @@ describe('codex usage request', () => {
     assert.equal(core.normalizeWindows(result.usage)[0].label, '5h session');
   });
 });
+
+// ── Fixes from the 2026-09-11 review ────────────────────────────────────────
+
+describe('dead login', () => {
+  const email = 'dead@x.com';
+  const guardedFetch = globalThis.fetch;
+  let usageCalls;
+  before(() => {
+    usageCalls = 0;
+    globalThis.fetch = async (input) => {
+      if (String(input) === core.USAGE_URL) {
+        usageCalls += 1;
+        return new Response(JSON.stringify({ limits: [{ kind: 'session', percent: 7 }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'refresh token revoked' }), { status: 400 });
+    };
+    core.saveIndex({ version: 1, accounts: [{ email, label: 'dead' }] });
+    core.tokenSet(email, { email, accessToken: 'a', refreshToken: 'r', expiresAt: Date.now() - 1000, refreshTokenExpiresAt: Date.now() + 20 * 86400000 });
+    fs.mkdirSync(path.dirname(core.CACHE_FILE), { recursive: true });
+    // Numbers from an earlier, healthy fetch are still in the cache.
+    fs.writeFileSync(core.CACHE_FILE, JSON.stringify({ [email]: { usage: { limits: [{ kind: 'session', percent: 42 }] }, fetchedAt: Date.now() - 600e3 } }));
+  });
+  after(() => {
+    globalThis.fetch = guardedFetch;
+    core.tokenDelete(email);
+    fs.rmSync(core.INDEX_FILE, { force: true });
+  });
+
+  it('recognises the errors that mean the login is gone', () => {
+    assert.equal(core.isDeadLoginError('token refresh failed (400 @ host): invalid_grant'), true);
+    assert.equal(core.isDeadLoginError('no refresh token stored; run `login`'), true);
+    assert.equal(core.isDeadLoginError('Anthropic returned 503'), false);
+    assert.equal(core.isDeadLoginError(undefined), false);
+  });
+
+  it('stays "sign in again" on every front end, not only the one that hit the slot', async () => {
+    const first = (await core.collect({ sync: false })).results[0];
+    assert.equal(first.needsLogin, true);
+    assert.equal(core.loginHealth(first).state, 'expired');
+    // Within the spacing the cached numbers used to come back with the login shown as healthy.
+    const second = (await core.collect({ sync: false })).results[0];
+    assert.equal(second.needsLogin, true, JSON.stringify(second));
+    assert.equal(second.usage, undefined);
+    assert.equal(core.loginHealth(second).state, 'expired');
+    assert.equal(usageCalls, 0);
+  });
+
+  it('fetches right away once the login has been renewed, instead of waiting out the spacing', async () => {
+    // A new `login` (or Claude Code's fresh token adopted by sync) rewrites the record.
+    core.tokenSet(email, { email, accessToken: 'new-a', refreshToken: 'new-r', expiresAt: Date.now() + 3600e3, updatedAt: Date.now() });
+    const renewed = (await core.collect({ sync: false })).results[0];
+    assert.equal(renewed.error, undefined, renewed.error);
+    assert.equal(renewed.needsLogin, undefined);
+    assert.equal(core.normalizeWindows(renewed.usage)[0].percent, 7);
+    assert.equal(usageCalls, 1);
+    // And the renewed token is then paced like any other: the next call is served from the cache.
+    assert.equal((await core.collect({ sync: false })).results[0].fetchedAt, renewed.fetchedAt);
+    assert.equal(usageCalls, 1);
+  });
+});
+
+describe('live Claude Code account lookup', () => {
+  const credentials = path.join(process.env.CLAUDE_CONFIG_DIR, '.credentials.json');
+  const guardedFetch = globalThis.fetch;
+  let profileCalls;
+  before(() => {
+    fs.mkdirSync(path.dirname(credentials), { recursive: true });
+    fs.writeFileSync(credentials, JSON.stringify({ claudeAiOauth: { accessToken: 'cc-access', refreshToken: 'cc-refresh', expiresAt: Date.now() + 3600e3 } }));
+    profileCalls = 0;
+    globalThis.fetch = async (input) => {
+      if (String(input) !== core.PROFILE_URL) throw new Error(`unexpected request: ${input}`);
+      profileCalls += 1;
+      return new Response(JSON.stringify({ account: { email: 'live@x.com' } }), { status: 200 });
+    };
+    fs.mkdirSync(path.dirname(core.CACHE_FILE), { recursive: true });
+    fs.writeFileSync(core.CACHE_FILE, '{}');
+  });
+  after(() => {
+    globalThis.fetch = guardedFetch;
+    fs.rmSync(credentials, { force: true });
+  });
+
+  it('asks the profile endpoint once per token, then remembers the answer', async () => {
+    const live = core.readClaudeCode();
+    assert.ok(live);
+    for (let i = 0; i < 3; i += 1) {
+      const who = await core.resolveLiveEmail(live, []);
+      assert.deepEqual(who, { email: 'live@x.com', verified: true });
+    }
+    assert.equal(profileCalls, 1);
+  });
+
+  it('does not match a token-less record against a credential without a refresh token', () => {
+    const live = { json: { claudeAiOauth: { accessToken: 'only-access' } } };
+    const records = [{ email: 'gone@x.com', label: 'gone', missing: true }];
+    assert.equal(core.matchLiveEmail(live, records).verified, false);
+    assert.equal(core.matchLiveEmail(live, [{ email: 'here@x.com', accessToken: 'only-access' }]).email, 'here@x.com');
+  });
+});
+
+describe('callback response', () => {
+  it('asks the browser to close the connection so the process can exit promptly', async () => {
+    const session = await core.beginLogin({});
+    const state = new URL(session.authorizeUrl).searchParams.get('state');
+    const res = await fetch(`http://localhost:${session.port}/callback?code=C&state=${encodeURIComponent(state)}`);
+    assert.equal(res.headers.get('connection'), 'close');
+    assert.match(await res.text(), /login complete/);
+    assert.equal(await session.waitForCode(), 'C');
+  });
+});
+
+describe('housekeeping', () => {
+  it('keeps the version constant in step with package.json', () => {
+    const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    assert.equal(core.VERSION, pkg.version);
+  });
+
+  it('describes an error object without a message as JSON, not [object Object]', () => {
+    assert.equal(core.describeBody({ error: { type: 'x', code: 7 } }), '{"type":"x","code":7}');
+    assert.equal(core.describeBody({ error: 'plain' }), 'plain');
+  });
+
+  it('measures display width with wide characters and emoji counted twice', () => {
+    assert.equal(core.displayWidth('work'), 4);
+    assert.equal(core.displayWidth('회사'), 4);
+    assert.equal(core.displayWidth('a회b'), 4);
+    assert.equal(core.displayWidth('🚀x'), 3);
+    assert.equal(core.displayWidth(''), 0);
+  });
+
+  it('warns when a second account takes a label that is already in use', async () => {
+    const warnings = [];
+    core.setLogger({ onWarn: (m) => warnings.push(m) });
+    const token = (email) => ({ provider: 'codex', accessToken: 'a', refreshToken: 'r', idToken: fakeJwt({ email }), expiresAt: Date.now() + 3600e3 });
+    try {
+      await core.persistAccount(token('one@openai.example'), { label: 'dup' });
+      await core.persistAccount(token('two@openai.example'), { label: 'dup' });
+      assert.equal(warnings.filter((m) => /label "dup" is also used by one@openai\.example/.test(m)).length, 1);
+      assert.throws(() => core.findAccount('codex:dup'), /matches 2 accounts/);
+      assert.equal(core.findAccount('codex:two@openai.example').entry.email, 'two@openai.example');
+    } finally {
+      core.setLogger({ onWarn: () => {} });
+      await core.removeAccount('codex:one@openai.example').catch(() => {});
+      await core.removeAccount('codex:two@openai.example').catch(() => {});
+    }
+  });
+});
+
+const { execFileSync } = await import('node:child_process');
+
+describe('cli', () => {
+  const run = (...args) => execFileSync(process.execPath, [new URL('../cli.mjs', import.meta.url).pathname, ...args], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' } });
+
+  it('prints its version', () => {
+    assert.equal(run('--version').trim(), `usage-bar ${core.VERSION}`);
+    assert.equal(run('-v').trim(), `usage-bar ${core.VERSION}`);
+  });
+
+  it('accepts -h', () => {
+    assert.match(run('-h'), /usage-bar — usage & reset times/);
+  });
+
+  it('answers --json with an empty list when nothing is tracked', () => {
+    fs.rmSync(core.INDEX_FILE, { force: true });
+    assert.deepEqual(JSON.parse(run('--json')), []);
+    assert.deepEqual(JSON.parse(run('status', '--json', '--provider', 'codex')), []);
+  });
+
+  it('keeps the human-readable hint for an empty store', () => {
+    fs.rmSync(core.INDEX_FILE, { force: true });
+    assert.throws(() => run('status'), (error) => /no accounts tracked yet/.test(error.stderr) && error.status === 1);
+  });
+});

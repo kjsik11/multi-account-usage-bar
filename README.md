@@ -47,6 +47,7 @@ usage-bar list                # accounts and login state
 usage-bar switch work         # point Claude Code at another account, no /login
 usage-bar switch codex:alt    # same for Codex
 usage-bar whoami              # what Claude Code and Codex are signed in as
+usage-bar --version           # (also -h for help)
 usage-bar remove work         # forget an account (deletes its tokens)
 ```
 
@@ -56,7 +57,7 @@ Reading usage costs no quota. The endpoint throttles hard, so at most one reques
 
 ## Unofficial
 
-Not affiliated with Anthropic or OpenAI; the endpoints are internal and may change. Anthropic's Consumer Terms (Feb 2026) say Pro/Max OAuth tokens may not be used in other tools — this only reads your own usage numbers, and a `--readonly` login can't run inference at all, but use it at your own discretion. `switch` rewrites the credential Claude Code or Codex holds; skip it if you only want to see your limits.
+Not affiliated with Anthropic or OpenAI; the endpoints are internal and may change. Anthropic's Consumer Terms (Feb 2026) say Pro/Max OAuth tokens may not be used in other tools — this only reads your own usage numbers, and a `--readonly` login can't run inference at all, but use it at your own discretion. `switch` rewrites the credential Claude Code or Codex holds; skip it if you only want to see your limits. A `claude` or `codex` session that is still running keeps its account, and if it refreshes its own token it writes that account back — switch when none is running if you want it to stick.
 
 ## License
 

@@ -2,14 +2,15 @@ APP_NAME    = MultiAccountUsageBar
 # The 1.x app, removed by `make install` / `make uninstall` so two copies never run.
 LEGACY_APP  = ClaudeUsageBar
 BUNDLE_ID   = io.github.kjsik11.multi-account-usage-bar
-VERSION    ?= 1.2.0
+# package.json is the one source of the version number; fall back if Node is missing.
+VERSION    ?= $(shell node -p "require('../package.json').version" 2>/dev/null || echo 0.0.0)
 BUILD_DIR   = build
 APP_BUNDLE  = $(BUILD_DIR)/$(APP_NAME).app
 CONTENTS    = $(APP_BUNDLE)/Contents
 DMG         = $(BUILD_DIR)/$(APP_NAME).dmg
 # Build for the Mac this runs on (arm64 or x86_64); override ARCH to cross-build.
 ARCH       ?= $(shell uname -m)
-SWIFT_FLAGS = -O -framework AppKit -target $(ARCH)-apple-macosx13.0
+SWIFT_FLAGS = -O -framework AppKit -framework ServiceManagement -target $(ARCH)-apple-macosx13.0
 
 .PHONY: all app dmg install uninstall run clean
 

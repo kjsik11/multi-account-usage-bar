@@ -1,7 +1,8 @@
 import AppKit
 import Foundation
+import ServiceManagement
 
-struct Window {
+struct Window: Equatable {
     let label: String
     let group: String
     let percent: Double?
@@ -25,11 +26,12 @@ enum Provider: String, CaseIterable {
     }
     /// Extra arguments that point a CLI command at this provider.
     var flag: [String] { self == .codex ? ["--provider", "codex"] : [] }
-    /// A `remove`/`switch` target that cannot be confused with the other provider's account.
-    func target(_ label: String) -> String { "\(rawValue):\(label)" }
+    /// A `remove`/`switch` target that cannot be confused with the other provider's
+    /// account. Pass the email: labels may repeat (two `me@…` addresses), emails cannot.
+    func target(_ email: String) -> String { "\(rawValue):\(email)" }
 }
 
-struct Account {
+struct Account: Equatable {
     let provider: Provider
     let label: String
     let email: String
@@ -83,10 +85,12 @@ enum CLI {
             directories += path.split(separator: ":").map(String.init)
         }
         if let found = firstExecutable(named: "node", in: directories) { return found }
-        // nvm keeps versioned directories; take the newest.
+        // nvm keeps versioned directories; take the newest — by version number, not
+        // by string, or "v9.11.2" would outrank "v22.1.0".
         let nvm = "\(NSHomeDirectory())/.nvm/versions/node"
         if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvm) {
-            for version in versions.sorted(by: >) {
+            let numeric = { (name: String) -> [Int] in name.drop { !$0.isNumber }.split(separator: ".").map { Int($0) ?? 0 } }
+            for version in versions.sorted(by: { numeric($0).lexicographicallyPrecedes(numeric($1)) }).reversed() {
                 let candidate = "\(nvm)/\(version)/bin/node"
                 if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
             }
@@ -104,9 +108,19 @@ enum CLI {
         return firstExecutable(named: "usage-bar", in: directories)
     }
 
-    /// Runs the CLI and returns stdout, or throws with stderr as the message.
+    struct Output {
+        let stdout: Data
+        let stderr: String
+        /// The CLI's `warn:` lines — worth showing even when the command succeeded
+        /// (e.g. "signing in twice may invalidate Claude Code's own token").
+        var warnings: [String] {
+            stderr.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.hasPrefix("warn:") }
+        }
+    }
+
+    /// Runs the CLI and returns its output, or throws with stderr as the message.
     @discardableResult
-    static func run(_ arguments: [String], timeout: TimeInterval = 45) throws -> Data {
+    static func run(_ arguments: [String], timeout: TimeInterval = 45) throws -> Output {
         let process = Process()
         if let script = bundledScript(), let node = locateNode() {
             process.executableURL = URL(fileURLWithPath: node)
@@ -121,7 +135,7 @@ enum CLI {
         }
         var environment = ProcessInfo.processInfo.environment
         environment["NO_COLOR"] = "1"
-        // Node lives outside the sandboxed app's default PATH.
+        // launchd starts GUI apps with a minimal PATH that has no Node in it.
         let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
         environment["PATH"] = (extraPaths + [environment["PATH"] ?? ""]).joined(separator: ":")
         process.environment = environment
@@ -130,24 +144,43 @@ enum CLI {
         let err = Pipe()
         process.standardOutput = out
         process.standardError = err
-        try process.run()
 
-        let deadline = Date().addingTimeInterval(timeout)
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
-        while process.isRunning && Date() < deadline { usleep(50_000) }
-        if process.isRunning {
-            process.terminate()
-            throw AppError.message("`usage-bar \(arguments.joined(separator: " "))` timed out.")
+        // Drain both pipes on their own threads: reading one to EOF on this thread
+        // would block until the CLI exits (so no timeout could ever fire) and would
+        // deadlock if the other pipe filled up first.
+        final class Sink { var data = Data() }
+        let outSink = Sink()
+        let errSink = Sink()
+        let readers = DispatchGroup()
+        for (handle, sink) in [(out.fileHandleForReading, outSink), (err.fileHandleForReading, errSink)] {
+            readers.enter()
+            DispatchQueue.global(qos: .utility).async {
+                sink.data = handle.readDataToEndOfFile()
+                readers.leave()
+            }
         }
-        process.waitUntilExit()
+        let exited = DispatchGroup()
+        exited.enter()
+        process.terminationHandler = { _ in exited.leave() }
+        do {
+            try process.run()
+        } catch {
+            exited.leave()
+            throw error
+        }
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            // A CLI that ignores SIGTERM (mid-request) gets a moment, then SIGKILL.
+            if exited.wait(timeout: .now() + 3) == .timedOut { kill(process.processIdentifier, SIGKILL) }
+            throw AppError.message("`usage-bar \(arguments.joined(separator: " "))` timed out after \(Int(timeout))s.")
+        }
+        readers.wait()
+        let stderr = String(data: errSink.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         if process.terminationStatus != 0 {
-            let message = String(data: errData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            throw AppError.message(message.isEmpty ? "usage-bar exited with status \(process.terminationStatus)" : message)
+            throw AppError.message(stderr.isEmpty ? "usage-bar exited with status \(process.terminationStatus)" : stderr)
         }
-        return outData
+        return Output(stdout: outSink.data, stderr: stderr)
     }
 }
 
@@ -201,13 +234,20 @@ final class UsageStore {
         return plain.date(from: text)
     }
 
-    func reload() {
+    /// One run of the CLI, as a value: produced on a background queue, applied on main.
+    enum Outcome {
+        case loaded(accounts: [Account], fetchedAt: Date?)
+        case failed(String)
+    }
+
+    /// Runs the CLI. Safe to call off the main thread — it touches no stored state.
+    func load() -> Outcome {
         do {
-            let data = try CLI.run(["--json"])
+            let data = try CLI.run(["--json"]).stdout
             guard let raw = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
                 throw AppError.message("Unexpected output from usage-bar --json")
             }
-            accounts = raw.map { item in
+            let accounts = raw.map { item in
                 let login = item["login"] as? [String: Any] ?? [:]
                 let windows = (item["windows"] as? [[String: Any]] ?? []).map { w in
                     Window(
@@ -232,11 +272,30 @@ final class UsageStore {
                     readOnly: item["readOnly"] as? Bool ?? false
                 )
             }
+            return .loaded(accounts: accounts, fetchedAt: raw.compactMap { parseDate($0["fetchedAt"]) }.max())
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    /// Main thread only — the menu and title read these properties from there, so
+    /// they are never written from the queue that ran the CLI. Returns whether anything
+    /// on screen changed. A failure keeps the last good numbers and records the error.
+    @discardableResult
+    func apply(_ outcome: Outcome) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        switch outcome {
+        case let .loaded(accounts, fetchedAt):
+            let changed = accounts != self.accounts || lastError != nil || fetchedAt != self.fetchedAt
+            self.accounts = accounts
+            self.fetchedAt = fetchedAt
             lastError = nil
             updatedAt = Date()
-            fetchedAt = raw.compactMap { parseDate($0["fetchedAt"]) }.max()
-        } catch {
-            lastError = error.localizedDescription
+            return changed
+        case let .failed(message):
+            let changed = message != lastError
+            lastError = message
+            return changed
         }
     }
 }
@@ -280,9 +339,26 @@ enum Prefs {
         set { defaults.set(newValue, forKey: "criticalPercent") }
     }
 
+    /// What the title shows per account: "all" windows, or just the "summary" (5h + weekly).
+    static var titleDetail: String {
+        get { defaults.string(forKey: "titleDetail") ?? "all" }
+        set { defaults.set(newValue, forKey: "titleDetail") }
+    }
+
+    /// Registered with the system, not remembered in defaults — the system's answer
+    /// is the only one that counts (the user can also flip it in System Settings).
     static var launchAtLogin: Bool {
-        get { defaults.bool(forKey: "launchAtLogin") }
-        set { defaults.set(newValue, forKey: "launchAtLogin") }
+        get { SMAppService.mainApp.status == .enabled }
+    }
+
+    /// Returns an error message when the system refused, nil on success.
+    static func setLaunchAtLogin(_ on: Bool) -> String? {
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 }
 
@@ -323,11 +399,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isRefreshing = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            self.store.reload()
+            let outcome = self.store.load()
             DispatchQueue.main.async {
                 self.isRefreshing = false
+                // Redraw only when something changed: most runs answer from the CLI's
+                // cache with identical numbers, and rebuilding an open menu for those
+                // would just reset the row under the pointer.
+                let changed = self.store.apply(outcome)
                 self.updateTitle()
-                if let menu = self.statusItem.menu { self.rebuild(menu) }
+                if changed, let menu = self.statusItem.menu { self.rebuild(menu) }
             }
         }
     }
@@ -377,9 +457,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let providers = titleProviders.isEmpty ? providersPresent : titleProviders
-        let usable = store.accounts.filter { $0.error == nil }
-        let needsAttention = store.accounts.contains(where: \.needsLogin)
-        let worstAll = usable.map(\.worst).max() ?? 0
+        // Red means an account of a provider the title covers is critical — a Codex
+        // account at 90% must not redden Claude's numbers when the title is Claude-only.
+        let usable = store.accounts.filter { $0.error == nil && providers.contains($0.provider) }
+        // ⚠ for a login that needs attention, and for a CLI run that failed after an
+        // earlier one succeeded — the numbers on screen are then older than they look.
+        let needsAttention = store.accounts.contains(where: \.needsLogin) || store.lastError != nil
+        let worstShown = usable.map(\.worst).max() ?? 0
         let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         let title = NSMutableAttributedString()
         for provider in providers {
@@ -389,14 +473,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // spelled out when that provider has more than one account to tell apart.
             title.append(NSAttributedString(string: provider.glyph, attributes: [.font: font, .foregroundColor: provider.color]))
             let several = store.accounts.filter { $0.provider == provider }.count > 1
-            // Every window in order: session, weekly all, per-model weekly.
-            let percents = account.windows.map { "\(Int(($0.percent ?? 0).rounded()))%" }.joined(separator: " ")
+            let percents = titleWindows(of: account).map { "\(Int(($0.percent ?? 0).rounded()))%" }.joined(separator: " ")
             let text = "\(several ? " \(account.label)" : "") \(percents.isEmpty ? "–" : percents)"
             title.append(NSAttributedString(
                 string: text,
                 attributes: [
                     .font: font,
-                    .foregroundColor: max(worstAll, account.worst) >= Prefs.criticalPercent ? NSColor.systemRed : NSColor.labelColor,
+                    .foregroundColor: max(worstShown, account.worst) >= Prefs.criticalPercent ? NSColor.systemRed : NSColor.labelColor,
                 ]
             ))
         }
@@ -408,6 +491,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.attributedTitle = title
     }
 
+    /// The windows the title lists for an account: all of them (session, weekly all,
+    /// per-model weekly) or, in summary mode, just the session and the first weekly one.
+    private func titleWindows(of account: Account) -> [Window] {
+        guard Prefs.titleDetail == "summary" else { return account.windows }
+        return [account.windows.first { $0.group == "session" }, account.windows.first { $0.group == "weekly" }].compactMap { $0 }
+    }
+
     private func meter(_ percent: Double?, width: Int = 14) -> String {
         guard let percent else { return String(repeating: "·", count: width) }
         let filled = min(width, max(0, Int((percent / 100 * Double(width)).rounded())))
@@ -417,18 +507,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// A non-interactive row. AppKit dims any item without an action, and an item
     /// with one highlights on hover as if it were a button — neither is right for a
     /// readout, so draw the text in the item's own view instead.
+    /// The widest a row may get. The usage rows never come near it; an error message
+    /// (up to a few hundred characters) is cut with an ellipsis and kept in the tooltip.
+    private static let rowMaxWidth: CGFloat = 560
+
     private func textItem(_ attributed: NSAttributedString, indent: Int = 0) -> NSMenuItem {
         let item = NSMenuItem()
         item.isEnabled = false
         let label = NSTextField(labelWithAttributedString: attributed)
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.lineBreakMode = .byClipping
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
         let leading: CGFloat = 14 + CGFloat(indent) * 18
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: label.intrinsicContentSize.width + leading + 18, height: 20))
+        let textWidth = min(label.intrinsicContentSize.width, Self.rowMaxWidth)
+        if textWidth < label.intrinsicContentSize.width { label.toolTip = attributed.string }
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: textWidth + leading + 18, height: 20))
         container.addSubview(label)
         NSLayoutConstraint.activate([
             label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: leading),
             label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualToConstant: textWidth),
             label.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -12),
         ])
         item.view = container
@@ -438,10 +536,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuild(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        if let error = store.lastError, store.accounts.isEmpty {
+        // A failed CLI run is shown whether or not older numbers are still on screen:
+        // silently keeping stale figures would let a missing Node go unnoticed for hours.
+        if let error = store.lastError {
+            let note = store.accounts.isEmpty ? error : "Last refresh failed — showing older numbers.  \(error)"
             menu.addItem(textItem(NSAttributedString(
-                string: error,
+                string: note,
                 attributes: [.foregroundColor: NSColor.systemRed, .font: NSFont.systemFont(ofSize: 12)]
+            )))
+            menu.addItem(.separator())
+        } else if store.accounts.isEmpty, store.updatedAt != nil {
+            menu.addItem(textItem(NSAttributedString(
+                string: "No accounts yet — use Add Account below.",
+                attributes: [.foregroundColor: NSColor.secondaryLabelColor, .font: NSFont.systemFont(ofSize: 12)]
             )))
             menu.addItem(.separator())
         }
@@ -514,18 +621,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(textItem(header, indent: 1))
 
+        // A login that needs renewing gets its button whether or not this run also
+        // produced usage numbers (it may have: the CLI's cache can outlive the login).
+        if account.needsLogin {
+            let item = NSMenuItem(title: "Sign in again", action: #selector(signIn(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = account
+            item.indentationLevel = 2
+            item.attributedTitle = NSAttributedString(
+                string: "⚠  Sign in again",
+                attributes: [.foregroundColor: NSColor.systemRed, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
+            )
+            menu.addItem(item)
+        }
+
         if let error = account.error {
-            if account.needsLogin {
-                let item = NSMenuItem(title: "Sign in again", action: #selector(signIn(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = account
-                item.indentationLevel = 2
-                item.attributedTitle = NSAttributedString(
-                    string: "⚠  Sign in again",
-                    attributes: [.foregroundColor: NSColor.systemRed, .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
-                )
-                menu.addItem(item)
-            }
             menu.addItem(textItem(
                 NSAttributedString(
                     string: error,
@@ -590,13 +700,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             menu.addItem(textItem(line, indent: 2))
         }
+        let loginColor: NSColor = account.needsLogin ? .systemRed : account.loginState == "expiring" ? .systemOrange : .tertiaryLabelColor
         menu.addItem(textItem(
             NSAttributedString(
                 string: account.loginMessage,
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: account.loginState == "expiring" ? NSColor.systemOrange : NSColor.tertiaryLabelColor,
-                ]
+                attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: loginColor]
             ),
             indent: 2
         ))
@@ -695,6 +803,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         coverParent.submenu = coverMenu
         submenu.addItem(coverParent)
 
+        let detailParent = NSMenuItem(title: "Menu Bar Detail", action: nil, keyEquivalent: "")
+        let detailMenu = NSMenu()
+        for (key, label) in [("all", "Every window"), ("summary", "Session and weekly only")] {
+            let item = NSMenuItem(title: label, action: #selector(setTitleDetail(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = key
+            item.state = Prefs.titleDetail == key ? .on : .off
+            detailMenu.addItem(item)
+        }
+        detailParent.submenu = detailMenu
+        submenu.addItem(detailParent)
+
         let warnParent = NSMenuItem(title: "Warn Above", action: nil, keyEquivalent: "")
         let warnMenu = NSMenu()
         for percent in [40, 50, 60, 70] {
@@ -706,6 +826,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         warnParent.submenu = warnMenu
         submenu.addItem(warnParent)
+
+        let criticalParent = NSMenuItem(title: "Critical Above", action: nil, keyEquivalent: "")
+        let criticalMenu = NSMenu()
+        for percent in [70, 80, 90, 95] {
+            let item = NSMenuItem(title: "\(percent)%", action: #selector(setCriticalPercent(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = percent
+            item.state = Int(Prefs.criticalPercent) == percent ? .on : .off
+            criticalMenu.addItem(item)
+        }
+        criticalParent.submenu = criticalMenu
+        submenu.addItem(criticalParent)
+
+        submenu.addItem(.separator())
+        let launch = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        launch.target = self
+        launch.state = Prefs.launchAtLogin ? .on : .off
+        submenu.addItem(launch)
 
         parent.submenu = submenu
         return parent
@@ -721,13 +859,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cli = provider == .claude ? "claude" : "codex"
         let alert = NSAlert()
         alert.messageText = "Point \(provider.client) at \(account.label)?"
-        alert.informativeText = "This rewrites the login \(provider.client) has stored.\n\nSessions that are already running keep the account they started with — quit and start `\(cli)` again to use \(account.label)."
+        alert.informativeText = "This rewrites the login \(provider.client) has stored.\n\nSessions that are already running keep the account they started with — quit and start `\(cli)` again to use \(account.label). A running session that refreshes its own token writes its account back over this one, so switch when none is running if you want it to stick."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Switch")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        runInBackground(["switch", provider.target(account.label)], successMessage: "\(provider.client) now uses \(account.label). Start a new `\(cli)` session to pick it up.")
+        runInBackground(["switch", provider.target(account.email)], successMessage: "\(provider.client) now uses \(account.label). Start a new `\(cli)` session to pick it up.")
     }
 
     @objc private func signIn(_ sender: NSMenuItem) {
@@ -756,7 +894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        runInBackground(["remove", account.provider.target(account.label)], successMessage: "Removed \(account.label).")
+        runInBackground(["remove", account.provider.target(account.email)], successMessage: "Removed \(account.label).")
     }
 
     @objc private func setInterval(_ sender: NSMenuItem) {
@@ -783,19 +921,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateTitle()
     }
 
+    @objc private func setCriticalPercent(_ sender: NSMenuItem) {
+        guard let percent = sender.representedObject as? Int else { return }
+        Prefs.criticalPercent = Double(percent)
+        updateTitle()
+    }
+
+    @objc private func setTitleDetail(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        Prefs.titleDetail = key
+        updateTitle()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        if let failure = Prefs.setLaunchAtLogin(!Prefs.launchAtLogin) {
+            let alert = NSAlert()
+            alert.messageText = "Could not change Launch at Login"
+            alert.informativeText = failure
+            alert.alertStyle = .warning
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
+    }
+
     private func runInBackground(_ arguments: [String], successMessage: String, timeout: TimeInterval = 60) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var failure: String?
+            var warnings: [String] = []
             do {
-                try CLI.run(arguments, timeout: timeout)
+                warnings = try CLI.run(arguments, timeout: timeout).warnings
             } catch {
                 failure = error.localizedDescription
             }
             DispatchQueue.main.async {
                 let alert = NSAlert()
-                alert.messageText = failure == nil ? "Usage Bar" : "Usage Bar failed"
-                alert.informativeText = failure ?? successMessage
-                alert.alertStyle = failure == nil ? .informational : .warning
+                alert.messageText = failure == nil ? "Multi-Account Usage Bar" : "Multi-Account Usage Bar failed"
+                // A command can succeed and still have something to say — "signing in
+                // twice may invalidate Claude Code's own token" must not be lost to stderr.
+                alert.informativeText = failure ?? ([successMessage] + warnings).joined(separator: "\n\n")
+                alert.alertStyle = failure == nil ? (warnings.isEmpty ? .informational : .warning) : .warning
                 NSApp.activate(ignoringOtherApps: true)
                 alert.runModal()
                 self?.refresh()

@@ -13,11 +13,16 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a.startsWith('--')) {
-      const [key, inlineValue] = a.slice(2).split('=');
+      // Split on the first `=` only, so `--label=a=b` keeps its value whole.
+      const eq = a.indexOf('=');
+      const key = eq === -1 ? a.slice(2) : a.slice(2, eq);
+      const inlineValue = eq === -1 ? undefined : a.slice(eq + 1);
       if (inlineValue !== undefined) flags[key] = inlineValue;
       else if (['label', 'interval', 'sort', 'provider'].includes(key)) flags[key] = argv[++i];
       else flags[key] = true;
-    } else positional.push(a);
+    } else if (a === '-h') flags.help = true;
+    else if (a === '-v' || a === '-V') flags.version = true;
+    else positional.push(a);
   }
   // `--codex` / `--claude` are shorthands for `--provider`.
   if (flags.codex && !flags.provider) flags.provider = 'codex';
@@ -78,8 +83,11 @@ function bar(p) {
 const PROVIDER_GLYPHS = { claude: '✳', codex: '⬢' };
 const providerTint = (p) => (p === 'codex' ? cyan : yellow);
 const providerTag = (p) => providerTint(p)(`${PROVIDER_GLYPHS[p]} ${core.PROVIDER_NAMES[p]}`);
-/** padEnd that ignores colour codes, so tagged columns line up whether or not colour is on. */
-const padVisible = (text, width) => text + ' '.repeat(Math.max(0, width - text.replace(/\x1b\[[0-9;]*m/g, '').length));
+/**
+ * padEnd by displayed width: colour codes count for nothing, wide characters (a
+ * Korean label, an emoji) for two — so columns line up whatever the label is made of.
+ */
+const padVisible = (text, width) => text + ' '.repeat(Math.max(0, width - core.displayWidth(text.replace(/\x1b\[[0-9;]*m/g, ''))));
 
 function renderAccount(result, labelWidth, { tagged = false } = {}) {
   const { record, usage, error, active } = result;
@@ -87,7 +95,7 @@ function renderAccount(result, labelWidth, { tagged = false } = {}) {
   const lines = [];
   const marker = active ? green('●') : dim('○');
   const tag = tagged ? `${providerTag(p)} ` : '';
-  const title = `${marker} ${tag}${bold(record.label.padEnd(labelWidth))} ${dim(record.email)}`;
+  const title = `${marker} ${tag}${bold(padVisible(record.label, labelWidth))} ${dim(record.email)}`;
   const health = core.loginHealth(result);
   const loginNote =
     health.state === 'expired' || health.state === 'missing'
@@ -162,7 +170,7 @@ function byProvider(results) {
 }
 
 function render(results) {
-  const labelWidth = Math.max(...results.map((r) => r.record.label.length), 4);
+  const labelWidth = Math.max(...results.map((r) => core.displayWidth(r.record.label)), 4);
   const groups = byProvider(results);
   const several = groups.length > 1;
   const heading = groups.map(([p]) => core.PROVIDER_NAMES[p]).join(' · ');
@@ -223,6 +231,8 @@ async function gather() {
     sort: opts.flags.sort,
     providers: wanted ? [wanted] : undefined,
   });
+  // Nothing tracked is an empty answer for a script (`[]`), a hint for a person.
+  if (opts.flags.json) return { results };
   if (empty) fail('no accounts tracked yet. Run `usage-bar login` (or `usage-bar login --provider codex`) to add one.');
   if (results.length === 0) fail(`no ${providerName()} accounts tracked yet. Run \`usage-bar login${providerFlag(wanted)}\` to add one.`);
   return { results };
@@ -235,6 +245,11 @@ async function cmdStatus() {
     return;
   }
   console.log(render(results));
+}
+
+/** Redraw in place: home the cursor and clear each line's tail, instead of wiping the screen (which flickers). */
+function redraw(text) {
+  process.stdout.write(`\x1b[H${text.split('\n').map((line) => `${line}\x1b[K`).join('\n')}\n\x1b[J`);
 }
 
 async function cmdWatch() {
@@ -252,8 +267,10 @@ async function cmdWatch() {
     } finally {
       running = false;
     }
-    process.stdout.write(`\x1b[2J\x1b[H${body}\n\n${dim(`redrawing every ${interval / 1000}s · requests go out at most every ${core.MIN_FETCH_SPACING_MS / 60000} min per account · ctrl+c to quit`)}\n`);
+    redraw(`${body}\n\n${dim(`redrawing every ${interval / 1000}s · requests go out at most every ${core.MIN_FETCH_SPACING_MS / 60000} min per account · ctrl+c to quit`)}`);
   };
+  // One full clear at the start; every tick after that paints over the previous frame.
+  process.stdout.write('\x1b[2J\x1b[H');
   await tick();
   const timer = setInterval(tick, interval);
   process.on('SIGINT', () => {
@@ -331,10 +348,9 @@ async function cmdLogin() {
       pastedCode = await session.waitForCode();
     }
   } catch (error) {
+    // A port clash cannot reach here: beginLogin() already took a free port (Claude)
+    // or failed with its own message (Codex, whose two ports are fixed).
     session.cancel();
-    if (error.code === 'EADDRINUSE') {
-      fail(`port ${core.CALLBACK_PORT} is already in use (a Claude Code /login in progress?) — retry with \`usage-bar login --manual\``);
-    }
     throw error;
   }
 
@@ -369,7 +385,7 @@ async function cmdList() {
   }
   const records = core.loadRecords(index);
   const live = await core.describeLive(records, { verify: false });
-  const labelWidth = Math.max(8, ...records.map((r) => r.label.length));
+  const labelWidth = Math.max(8, ...records.map((r) => core.displayWidth(r.label)));
   for (const record of records) {
     const p = core.accountProvider(record);
     const active = live[p]?.email && record.email === live[p].email ? green(' active') : '';
@@ -383,7 +399,7 @@ async function cmdList() {
         ]
           .filter(Boolean)
           .join(' · ');
-    console.log(`${padVisible(providerTag(p), 9)} ${bold(record.label.padEnd(labelWidth))} ${record.email.padEnd(28)} ${dim(state)}${active}`);
+    console.log(`${padVisible(providerTag(p), 9)} ${bold(padVisible(record.label, labelWidth))} ${padVisible(record.email, 28)} ${dim(state)}${active}`);
   }
 }
 
@@ -460,6 +476,7 @@ async function cmdSwitch() {
     `${green('✔')} ${client} now uses ${providerTag(result.provider)} ${bold(result.entry.label)} ${dim(result.entry.email)}${result.updatedGlobal ? '' : dim(' (account cache in ~/.claude.json not updated)')}`,
   );
   console.log(dim(`   start a new \`${result.provider === 'codex' ? 'codex' : 'claude'}\` session to pick it up`));
+  console.log(dim('   a session that is still running keeps its own account — and if it refreshes its token, it writes that account back over this one'));
 }
 
 function cmdHelp() {
@@ -476,6 +493,7 @@ ${bold('usage')}
   usage-bar sync                                           pull the latest token for each active account from its CLI
   usage-bar switch <email|label>                           make Claude Code (or Codex) use a tracked account without a new login
   usage-bar whoami                                         which account Claude Code and Codex are logged in as
+  usage-bar --version | -h                                 version · this help
 
 ${bold('codex')}
   Every command takes ${bold('--provider codex')} (or ${bold('--codex')}) to act on OpenAI Codex instead of Claude:
@@ -511,6 +529,17 @@ const commands = {
   whoami: cmdWhoami,
   help: cmdHelp,
 };
+
+// `usage-bar --json | head -1`: the reader going away is not an error worth a stack trace.
+process.stdout.on('error', (error) => {
+  if (error.code === 'EPIPE') process.exit(0);
+  throw error;
+});
+
+if (opts.flags.version) {
+  console.log(`usage-bar ${core.VERSION}`);
+  process.exit(0);
+}
 
 const handler = commands[opts.command];
 if (!handler || opts.flags.help) {

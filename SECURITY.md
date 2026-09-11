@@ -21,7 +21,7 @@ CLI or OpenAI's API, use OpenAI's programme: <https://openai.com/security/disclo
 | Access + refresh tokens | macOS Keychain, service `multi-account-usage-bar`, one item per account (`<email>` for Claude, `codex:<email>` for Codex) | Keychain ACL |
 | Access + refresh tokens (non-macOS, or `USAGE_BAR_STORE=file`) | `~/.config/multi-account-usage-bar/tokens.json` | `0600`, in a `0700` directory |
 | Account index (email, label) | `~/.config/multi-account-usage-bar/accounts.json` | `0600` |
-| Cached usage numbers | `~/.config/multi-account-usage-bar/usage-cache.json` | `0600` |
+| Cached usage numbers, and the address Claude Code's current token resolved to | `~/.config/multi-account-usage-bar/usage-cache.json` | `0600` |
 | Claude Code's own login (written only by `switch`, or to hand back a rotated pair) | macOS Keychain, service `Claude Code-credentials`; elsewhere `~/.claude/.credentials.json` | Keychain ACL; `0600`, the directory's mode is Claude Code's and is not changed |
 | Claude Code's cached account block (`oauthAccount`, updated only by `switch`) | `~/.claude.json` | the file's existing mode is kept |
 | Codex's own login (written only by `switch`, or to hand back a rotated pair) | `~/.codex/auth.json` | `0600`; the directory's mode is Codex's and is not changed |

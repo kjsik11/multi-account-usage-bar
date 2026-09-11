@@ -21,7 +21,9 @@ export const CALLBACK_PORT = 54545;
 export const CALLBACK_PATH = '/callback';
 export const MANUAL_REDIRECT_URI = 'https://console.anthropic.com/oauth/code/callback';
 export const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
-const USER_AGENT = 'multi-account-usage-bar/1.2';
+/** Kept in step with package.json by a test; the app bundle ships without package.json. */
+export const VERSION = '1.2.0';
+const USER_AGENT = `multi-account-usage-bar/${VERSION.split('.').slice(0, 2).join('.')}`;
 
 // Codex (OpenAI) — the ChatGPT login the Codex CLI uses. Same shape as the Claude
 // side: PKCE sign-in, a rotating refresh token, and a usage endpoint that reports a
@@ -201,13 +203,31 @@ export function scrub(text) {
 export function describeBody(body) {
   if (typeof body === 'string') return redact(body.slice(0, 200));
   if (body && typeof body === 'object') {
-    return redact(body.error?.message || body.error_description || body.error || JSON.stringify(body).slice(0, 200));
+    const text = body.error?.message || body.error_description || body.error || body;
+    return redact((typeof text === 'string' ? text : JSON.stringify(text)).slice(0, 200));
   }
   return redact(String(body));
 }
 
+/**
+ * Terminal columns a string occupies: East Asian wide/fullwidth characters and
+ * emoji take two, so `padEnd` alone misaligns a table with a Korean label in it.
+ */
+export function displayWidth(text) {
+  let width = 0;
+  for (const ch of String(text)) {
+    if (/[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]|\p{Extended_Pictographic}/u.test(ch)) width += 2;
+    else if (!/\p{M}/u.test(ch)) width += 1;
+  }
+  return width;
+}
+
+// Fixed paths, not a PATH lookup: this binary is handed every token on the machine.
+const SECURITY_BIN = '/usr/bin/security';
+const OPEN_BIN = '/usr/bin/open';
+
 function security(args) {
-  return spawnSync('security', args, { encoding: 'utf8' });
+  return spawnSync(SECURITY_BIN, args, { encoding: 'utf8' });
 }
 
 function decodeKeychainSecret(raw) {
@@ -710,7 +730,7 @@ export function openBrowser(url) {
           windowsVerbatimArguments: true,
           windowsHide: true,
         })
-      : spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [url], { stdio: 'ignore', detached: true });
+      : spawn(process.platform === 'darwin' ? OPEN_BIN : 'xdg-open', [url], { stdio: 'ignore', detached: true });
     child.on('error', () => {});
     child.unref();
     return true;
@@ -743,6 +763,8 @@ const CALLBACK_HEADERS = {
   'Referrer-Policy': 'no-referrer',
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
+  // One request per socket: nothing to keep alive once the code has arrived.
+  Connection: 'close',
 };
 
 function waitForCallback(port, expectedState, callbackPath = CALLBACK_PATH) {
@@ -754,6 +776,10 @@ function waitForCallback(port, expectedState, callbackPath = CALLBACK_PATH) {
     const settle = (fn, value) => {
       clearTimeout(timer);
       server.close();
+      // `close` alone leaves the browser's speculative keep-alive sockets open, which
+      // on Node 18 keeps the process alive for their idle timeout after a login is
+      // done. The socket carrying the response closes itself (`Connection: close`).
+      server.closeIdleConnections?.();
       fn(value);
     };
     const server = http.createServer((req, res) => {
@@ -1037,7 +1063,11 @@ function claudeRecords(records) {
 
 export function matchLiveEmail(live, records) {
   const oauth = live.json.claudeAiOauth;
-  const byToken = claudeRecords(records).find((r) => r.refreshToken === oauth.refreshToken || r.accessToken === oauth.accessToken);
+  // Only a token that exists on both sides is evidence: a record whose token is
+  // missing and a credential without a refresh token must not "match" on undefined.
+  const byToken = claudeRecords(records).find(
+    (r) => (oauth.refreshToken && r.refreshToken === oauth.refreshToken) || (oauth.accessToken && r.accessToken === oauth.accessToken),
+  );
   if (byToken) return { email: byToken.email, verified: true };
   const hint = readClaudeGlobalConfig()?.oauthAccount?.emailAddress;
   return { email: hint ?? null, verified: false };
@@ -1052,16 +1082,20 @@ export async function resolveLiveEmail(live, records) {
   if (match.verified) return match;
   const oauth = live.json.claudeAiOauth;
   if (!isExpired(oauth, 0)) {
-    // This rides on Claude Code's own token. A lookup that keeps failing (throttled,
-    // offline) must not be repeated by every front end on every refresh — that is
-    // exactly the knocking that keeps a throttle from clearing.
+    // This rides on Claude Code's own token, so the answer is remembered per token:
+    // an access token's identity cannot change, and a lookup that keeps failing
+    // (throttled, offline) must not be repeated by every front end on every refresh
+    // — that is exactly the knocking that keeps a throttle from clearing.
     const fingerprint = tokenFingerprint(oauth.accessToken);
     const recent = readCache()[PROFILE_KEY];
-    if (recent?.fingerprint === fingerprint && Date.now() - (recent.failedAt ?? 0) < PROFILE_RETRY_SPACING_MS) {
-      return match;
+    if (recent?.fingerprint === fingerprint) {
+      if (typeof recent.email === 'string' && recent.email) return { email: recent.email, verified: true };
+      if (Date.now() - (recent.failedAt ?? 0) < PROFILE_RETRY_SPACING_MS) return match;
     }
     try {
-      return { email: (await fetchProfile(oauth.accessToken)).email, verified: true };
+      const { email } = await fetchProfile(oauth.accessToken);
+      await cacheUpdate(PROFILE_KEY, { fingerprint, email, verifiedAt: Date.now() }, { replace: true });
+      return { email, verified: true };
     } catch (error) {
       await cacheUpdate(PROFILE_KEY, { fingerprint, failedAt: Date.now() }, { replace: true });
       warn(`could not verify the active Claude Code account: ${error.message}`);
@@ -1241,13 +1275,20 @@ function inCooldown(entry, now) {
  * Decide, atomically across processes, whether the caller may send a usage request
  * for `email` right now. When it may, the attempt is recorded before the request
  * goes out, so even a crash mid-request counts against the spacing.
+ *
+ * `renewedAt` is when the caller's token record was last written. The spacing
+ * guards one access token against being polled too often; a login the last attempt
+ * found dead and that has been renewed since (a new `login`, or Claude Code's own
+ * fresh token adopted) is a different token, and is not made to wait out the
+ * spacing behind the failure — nor to show "sign in again" for five more minutes.
  */
-function claimFetchSlot(email, now = Date.now()) {
+function claimFetchSlot(email, now = Date.now(), { renewedAt = 0 } = {}) {
   const cache = readCache();
   const entry = cache[email] ?? {};
   if (inCooldown(entry, now)) return { kind: 'cooldown', entry };
   const sinceLast = now - lastAttemptAt(entry);
-  if (sinceLast < spacingFor(entry, now) - SPACING_TOLERANCE_MS) {
+  const renewed = isDeadLoginError(entry.lastError) && renewedAt > lastAttemptAt(entry);
+  if (!renewed && sinceLast < spacingFor(entry, now) - SPACING_TOLERANCE_MS) {
     const inflight = !entry.usage && !entry.lastError && Boolean(entry.attemptedAt) && sinceLast < INFLIGHT_WAIT_MS;
     return { kind: inflight ? 'inflight' : 'spacing', entry };
   }
@@ -1269,6 +1310,11 @@ function rateLimitedMessage(entry) {
 
 const THROTTLE_NOTE = 'request throttling by the usage endpoint, not your subscription quota';
 
+/** An error that means the stored login is gone for good, not that a request failed. */
+export function isDeadLoginError(message) {
+  return /invalid_grant|no refresh token|refresh token/i.test(String(message ?? ''));
+}
+
 /**
  * Usage for one account. Goes to the network only when the machine-wide timing
  * policy allows it (the constants at the top of this file); otherwise answers from
@@ -1283,7 +1329,7 @@ export async function fetchUsage(record, live) {
   let gate;
   for (;;) {
     try {
-      gate = await withCacheLock(() => claimFetchSlot(email));
+      gate = await withCacheLock(() => claimFetchSlot(email, Date.now(), { renewedAt: record.updatedAt ?? 0 }));
     } catch (error) {
       if (error.code !== 'ELOCKED') throw error;
       // Cannot coordinate, so do the safe thing: answer from the cache, send nothing.
@@ -1305,7 +1351,10 @@ export async function fetchUsage(record, live) {
     throw new Error(`${rateLimitedMessage(entry)} (${THROTTLE_NOTE})`);
   }
   if (gate.kind === 'spacing') {
-    if (entry.usage) {
+    // A login the last attempt found dead stays dead until someone signs in again;
+    // answering from the cache meanwhile would show the account as healthy in every
+    // front end except the one that hit the slot, and flip back every five minutes.
+    if (entry.usage && !isDeadLoginError(entry.lastError)) {
       const age = entry.fetchedAt ? ` — showing values from ${formatRelative(Date.now() - entry.fetchedAt)} ago` : '';
       return fromCacheResult(record, entry, entry.lastError ? `${entry.lastError}${age}` : undefined);
     }
@@ -1574,6 +1623,10 @@ export async function persistAccount(working, { label: requestedLabel, mergeClau
   const index = loadIndex();
   const existing = index.accounts.find((a) => a.email === email && accountProvider(a) === provider);
   const label = requestedLabel || existing?.label || email.split('@')[0];
+  // Two accounts may end up with one label (two `me@…` addresses, or the same
+  // `--label` twice). Allowed, but then only the email address names either one.
+  const clash = index.accounts.find((a) => a !== existing && accountProvider(a) === provider && a.label === label);
+  if (clash) warn(`label "${label}" is also used by ${clash.email} — use the email address to refer to either account`);
   const key = storeKey({ provider, email });
   const previous = tokenGet(key);
   const record = compact({
@@ -1712,8 +1765,7 @@ export async function collect({ sync = true, sort, providers } = {}) {
       const { record: fresh, usage, fetchedAt, stale } = await fetchUsage(record, liveFor[provider]);
       return { record: fresh, active, usage, fetchedAt, stale };
     } catch (error) {
-      const dead = /invalid_grant|no refresh token|refresh token/i.test(error.message);
-      return { record, active, error: error.message, needsLogin: dead };
+      return { record, active, error: error.message, needsLogin: isDeadLoginError(error.message) };
     }
   }));
   return { results: sortResults(results, sort), liveEmail, live: liveByProvider, empty: false };
