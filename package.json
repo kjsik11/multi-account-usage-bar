@@ -1,0 +1,47 @@
+{
+  "name": "multi-account-usage-bar",
+  "version": "1.2.0",
+  "description": "Usage limits and reset times across multiple Claude Code and Codex (ChatGPT) accounts — CLI and macOS menu bar app",
+  "type": "module",
+  "bin": {
+    "usage-bar": "./cli.mjs"
+  },
+  "files": [
+    "cli.mjs",
+    "src/",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/core.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kjsik11/multi-account-usage-bar"
+  },
+  "keywords": [
+    "usage",
+    "rate-limit",
+    "quota",
+    "multi-account",
+    "menubar",
+    "cli",
+    "claude",
+    "claude-code",
+    "claude-max",
+    "anthropic",
+    "codex",
+    "openai",
+    "chatgpt"
+  ],
+  "homepage": "https://github.com/kjsik11/multi-account-usage-bar#readme",
+  "bugs": {
+    "url": "https://github.com/kjsik11/multi-account-usage-bar/issues"
+  },
+  "author": "Jongsik Kim"
+}

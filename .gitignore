@@ -1,0 +1,30 @@
+node_modules/
+.DS_Store
+Thumbs.db
+
+# build artefacts — never commit binaries; releases are built by CI
+build/
+menubar/build/
+*.app
+*.dmg
+*.tgz
+*.o
+*.swiftmodule
+
+# local environment, editor state, logs
+.env
+.env.*
+*.log
+*.tmp
+.vscode/
+.idea/
+*.swp
+.claude/settings.local.json
+
+# nothing under the repo ever holds a credential: tokens live in the Keychain or
+# ~/.config/multi-account-usage-bar — but keep any stray dump out just in case
+tokens.json
+auth.json
+usage-cache.json
+*.pem
+*.key

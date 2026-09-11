@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Test
+        run: node --test test/core.test.mjs
+      - name: Build the CLI tarball
+        run: npm pack --pack-destination .
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: multi-account-usage-bar-*.tgz
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **CLI** — no download needed:
+            ```bash
+            npm install -g github:${{ github.repository }}
+            ```
+            or install the attached tarball:
+            ```bash
+            npm install -g ./multi-account-usage-bar-*.tgz
+            ```
+
+            **macOS menu bar app** — build from source (needs Xcode command line tools and Node 18+):
+            ```bash
+            git clone https://github.com/${{ github.repository }}.git
+            cd multi-account-usage-bar/menubar && make install
+            ```
