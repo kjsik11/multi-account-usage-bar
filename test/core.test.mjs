@@ -165,7 +165,7 @@ describe('oauth login session', () => {
 
   it('ignores a callback whose state does not match, and never echoes it back', async () => {
     const session = await core.beginLogin({});
-    const res = await fetch(`http://localhost:${session.port}/callback?code=stray&state=WRONG`);
+    const res = await fetch(`http://127.0.0.1:${session.port}/callback?code=stray&state=WRONG`);
     assert.equal(res.status, 404);
     assert.ok(!(await res.text()).includes('WRONG'));
     session.cancel();
@@ -180,7 +180,7 @@ describe('oauth login session', () => {
       const state = new URL(session.authorizeUrl).searchParams.get('state');
       const body = await (
         await fetch(
-          `http://localhost:${session.port}/callback?error=${encodeURIComponent(payload)}&state=${useRightState ? encodeURIComponent(state) : 'WRONG'}`,
+          `http://127.0.0.1:${session.port}/callback?error=${encodeURIComponent(payload)}&state=${useRightState ? encodeURIComponent(state) : 'WRONG'}`,
         )
       ).text();
       // The payload may be echoed, but only ever as inert escaped text.
@@ -195,7 +195,7 @@ describe('oauth login session', () => {
   it('completes a callback that carries the right state', async () => {
     const session = await core.beginLogin({});
     const state = new URL(session.authorizeUrl).searchParams.get('state');
-    const res = await fetch(`http://localhost:${session.port}/callback?code=THECODE&state=${encodeURIComponent(state)}`);
+    const res = await fetch(`http://127.0.0.1:${session.port}/callback?code=THECODE&state=${encodeURIComponent(state)}`);
     assert.equal(res.status, 200);
     assert.equal(await session.waitForCode(), 'THECODE');
   });
@@ -727,9 +727,9 @@ describe('codex login session', () => {
   it('answers the Codex callback path and completes with the code', async () => {
     const session = await core.beginLogin({ provider: 'codex' });
     const state = new URL(session.authorizeUrl).searchParams.get('state');
-    const wrongPath = await fetch(`http://localhost:${session.port}/callback?code=x&state=${encodeURIComponent(state)}`);
+    const wrongPath = await fetch(`http://127.0.0.1:${session.port}/callback?code=x&state=${encodeURIComponent(state)}`);
     assert.equal(wrongPath.status, 404);
-    const res = await fetch(`http://localhost:${session.port}/auth/callback?code=CODEXCODE&state=${encodeURIComponent(state)}`);
+    const res = await fetch(`http://127.0.0.1:${session.port}/auth/callback?code=CODEXCODE&state=${encodeURIComponent(state)}`);
     assert.equal(res.status, 200);
     assert.equal(await session.waitForCode(), 'CODEXCODE');
   });
@@ -937,7 +937,7 @@ describe('callback response', () => {
   it('asks the browser to close the connection so the process can exit promptly', async () => {
     const session = await core.beginLogin({});
     const state = new URL(session.authorizeUrl).searchParams.get('state');
-    const res = await fetch(`http://localhost:${session.port}/callback?code=C&state=${encodeURIComponent(state)}`);
+    const res = await fetch(`http://127.0.0.1:${session.port}/callback?code=C&state=${encodeURIComponent(state)}`);
     assert.equal(res.headers.get('connection'), 'close');
     assert.match(await res.text(), /login complete/);
     assert.equal(await session.waitForCode(), 'C');
