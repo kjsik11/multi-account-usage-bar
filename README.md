@@ -2,7 +2,7 @@
 
 **Every Claude Max/Pro and ChatGPT (Codex) account's rate limits in one place** — session, weekly, per-model, and when each resets. A CLI and a macOS menu bar app, sharing one account store.
 
-**100% local.** No server, no telemetry, no dependencies. Tokens stay on your machine and only go to Anthropic's and OpenAI's own endpoints — the same ones `/usage` and `/status` call.
+**100% local.** No server, no telemetry, no dependencies. Tokens stay on your machine (macOS Keychain, or `~/.config` elsewhere — see [SECURITY.md](SECURITY.md)) and only go to Anthropic's and OpenAI's own endpoints — the same ones `/usage` and `/status` call.
 
 <p align="center"><img src="docs/cli.png" width="760" alt="usage-bar in a terminal"></p>
 <p align="center"><img src="docs/menubar.png" width="560" alt="Multi-Account Usage Bar menu bar dropdown"></p>
@@ -54,12 +54,9 @@ usage-bar remove work         # forget an account (deletes its tokens)
 
 Reading usage costs no quota. The endpoint throttles hard, so at most one request per account every 5 minutes, machine-wide — CLI, `watch` and the app share one cache.
 
-## Notes
+## Unofficial
 
-- **Storage:** macOS Keychain (service `multi-account-usage-bar`); Linux/Windows `~/.config/multi-account-usage-bar/tokens.json` (0600). Details in [SECURITY.md](SECURITY.md).
-- **Login lifetime:** a Claude login lasts ~28 days (Anthropic's limit; refreshing doesn't extend it). Every view shows how long each has left.
-- **Codex:** main 5h / 7d windows only. Browser login needs port 1455 or 1457 free; no `--manual`.
-- **Unofficial.** Not affiliated with Anthropic or OpenAI; the endpoints are internal and may change. Anthropic's Consumer Terms (Feb 2026) say Pro/Max OAuth tokens may not be used in other tools — this only reads your own usage numbers, and a `--readonly` login can't run inference at all, but use it at your own discretion. `switch` rewrites the credential Claude Code or Codex holds; skip it if you only want to see your limits.
+Not affiliated with Anthropic or OpenAI; the endpoints are internal and may change. Anthropic's Consumer Terms (Feb 2026) say Pro/Max OAuth tokens may not be used in other tools — this only reads your own usage numbers, and a `--readonly` login can't run inference at all, but use it at your own discretion. `switch` rewrites the credential Claude Code or Codex holds; skip it if you only want to see your limits.
 
 ## License
 
