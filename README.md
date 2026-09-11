@@ -2,7 +2,7 @@
 
 **Every Claude Max/Pro and ChatGPT (Codex) account's rate limits in one place** — session, weekly, per-model, and when each resets. A CLI and a macOS menu bar app, sharing one account store.
 
-**100% local.** No server, no telemetry, no dependencies. Tokens stay on your machine (macOS Keychain, or `~/.config` elsewhere — see [SECURITY.md](SECURITY.md)) and only go to Anthropic's and OpenAI's own endpoints — the same ones `/usage` and `/status` call.
+**100% local.** No server, no telemetry, no dependencies. Tokens stay in your macOS Keychain (see [SECURITY.md](SECURITY.md)) and only go to Anthropic's and OpenAI's own endpoints — the same ones `/usage` and `/status` call.
 
 <p align="center"><img src="docs/cli.png" width="760" alt="usage-bar in a terminal"></p>
 <p align="center"><img src="docs/menubar.png" width="560" alt="Multi-Account Usage Bar menu bar dropdown"></p>
@@ -13,7 +13,7 @@ Claude Code and Codex only show the account they are signed in as. This keeps it
 
 ## Install
 
-Node 18+.
+macOS only. Node 18+.
 
 ```bash
 npm install -g github:kjsik11/multi-account-usage-bar          # CLI → `usage-bar`
