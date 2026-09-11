@@ -81,8 +81,13 @@ export const CACHE_LOCK_FILE = path.join(CONFIG_DIR, 'usage-cache.lock');
 export const MIN_FETCH_SPACING_MS = 300 * 1000;
 /** An account the endpoint throttled within this long is polled at twice the spacing. */
 export const LIMITED_MEMORY_MS = 60 * 60 * 1000;
-/** Never send usage requests for two different accounts closer together than this. */
-export const ACCOUNT_STAGGER_MS = 2 * 1000;
+/**
+ * Never send usage requests for two different accounts closer together than this.
+ * The throttle above is per access token, so this only keeps a cold start from
+ * looking like a burst from one machine; it is also most of what a cold `status`
+ * costs, since every account waits its turn behind it.
+ */
+export const ACCOUNT_STAGGER_MS = 300;
 /** After a 429: send nothing for this long, doubling on each consecutive 429 … */
 export const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 /** … up to this. */
@@ -1679,24 +1684,24 @@ export async function collect({ sync = true, sort, providers } = {}) {
   records = codex.records;
   const liveByProvider = { claude: liveEmail, codex: codex.liveEmail };
   const liveFor = { claude: live, codex: codex.live };
-  // One account at a time: the requests that do go out are spaced by
-  // ACCOUNT_STAGGER_MS, and cached accounts answer instantly anyway.
-  const results = [];
-  for (const record of records) {
+  // All accounts at once: the requests that do go out are still sent one at a
+  // time, ACCOUNT_STAGGER_MS apart (fetchUsage claims each slot under the machine-
+  // wide lock), but their round trips overlap instead of queueing, and cached
+  // accounts answer instantly either way.
+  const results = await Promise.all(records.map(async (record) => {
     const provider = accountProvider(record);
     const active = Boolean(liveByProvider[provider]) && record.email === liveByProvider[provider];
     if (record.missing) {
-      results.push({ record, active, error: 'token not found in store — run `login` or `add` for this account' });
-      continue;
+      return { record, active, error: 'token not found in store — run `login` or `add` for this account' };
     }
     try {
       const { record: fresh, usage, fetchedAt, stale } = await fetchUsage(record, liveFor[provider]);
-      results.push({ record: fresh, active, usage, fetchedAt, stale });
+      return { record: fresh, active, usage, fetchedAt, stale };
     } catch (error) {
       const dead = /invalid_grant|no refresh token|refresh token/i.test(error.message);
-      results.push({ record, active, error: error.message, needsLogin: dead });
+      return { record, active, error: error.message, needsLogin: dead };
     }
-  }
+  }));
   return { results: sortResults(results, sort), liveEmail, live: liveByProvider, empty: false };
 }
 

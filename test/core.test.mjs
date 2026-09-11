@@ -532,6 +532,29 @@ describe('usage request timing', () => {
     assert.ok(calls[1] - calls[0] >= core.ACCOUNT_STAGGER_MS - 20, `${calls[1] - calls[0]}ms apart`);
   });
 
+  it('fetches every account of a collect() at once, sends staggered, order kept', async () => {
+    const emails = ['c1@x.com', 'c2@x.com', 'c3@x.com'];
+    core.saveIndex({ version: 1, accounts: emails.map((e) => ({ email: e, label: e.split('@')[0] })) });
+    for (const e of emails) core.tokenSet(e, { ...record(), email: e });
+    let slow = 0;
+    responder = () => {
+      slow += 1;
+      // A slow first reply must not hold the others back.
+      return slow === 1 ? new Promise((resolve) => setTimeout(() => resolve(ok()), 4 * core.ACCOUNT_STAGGER_MS)) : ok();
+    };
+    const started = Date.now();
+    const { results } = await core.collect({ sync: false });
+    const elapsed = Date.now() - started;
+    assert.deepEqual(results.map((r) => r.record.email), emails);
+    assert.ok(results.every((r) => r.usage && !r.error), JSON.stringify(results.map((r) => r.error)));
+    assert.equal(calls.length, 3);
+    const gaps = calls.slice(1).map((t, i) => t - calls[i]);
+    assert.ok(gaps.every((g) => g >= core.ACCOUNT_STAGGER_MS - 20), `gaps ${gaps.join(', ')}ms`);
+    // Sequential would be ≥ 4 + 1 + 1 staggers; overlapped, the slow reply sets the pace.
+    assert.ok(elapsed < 5.5 * core.ACCOUNT_STAGGER_MS, `took ${elapsed}ms`);
+    for (const e of emails) core.tokenDelete(e);
+  });
+
   it('recovers a lock left behind by a dead process', async () => {
     fs.writeFileSync(core.CACHE_LOCK_FILE, '0');
     const old = Date.now() / 1000 - 60;
