@@ -1210,6 +1210,20 @@ async function cacheUpdate(key, patch, { replace = false } = {}) {
   }
 }
 
+/** Drop one cache entry under the lock; a missing key is not an error. */
+async function cacheDelete(key) {
+  try {
+    await withCacheLock(() => {
+      const cache = readCache();
+      if (!(key in cache)) return;
+      delete cache[key];
+      writeCache(cache);
+    });
+  } catch (error) {
+    warn(`could not update the usage cache: ${error.message}`);
+  }
+}
+
 function lastAttemptAt(entry) {
   return Math.max(entry.attemptedAt ?? 0, entry.fetchedAt ?? 0);
 }
@@ -1732,12 +1746,14 @@ export function findAccount(target, { provider } = {}) {
   return pick(pool.filter((a) => a.email === name), false) ?? pick(pool.filter((a) => a.label === name), true);
 }
 
-export function removeAccount(target, options) {
+/** Forget an account: its tokens, its index entry, and its cached usage numbers. */
+export async function removeAccount(target, options) {
   const found = findAccount(target, options);
   if (!found) throw new Error(`no tracked account matches "${target}"`);
   tokenDelete(storeKey(found.entry));
   found.index.accounts = found.index.accounts.filter((a) => a !== found.entry);
   saveIndex(found.index);
+  await cacheDelete(storeKey(found.entry));
   return { ...found.entry, provider: found.provider };
 }
 

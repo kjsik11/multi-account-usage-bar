@@ -654,8 +654,11 @@ describe('codex auth.json', () => {
     assert.throws(() => core.findAccount('same@x.com'), /codex:same@x.com or claude:same@x.com/);
     assert.equal(core.findAccount('codex:work').provider, 'codex');
     assert.equal(core.findAccount('work', { provider: 'claude' }).provider, 'claude');
-    assert.equal(core.removeAccount('codex:same@x.com').provider, 'codex');
+    fs.writeFileSync(core.CACHE_FILE, JSON.stringify({ 'codex:same@x.com': { usage: {} }, 'same@x.com': { usage: {} } }));
+    assert.equal((await core.removeAccount('codex:same@x.com')).provider, 'codex');
     assert.equal(core.tokenGet('codex:same@x.com'), null);
+    // The cached numbers go with the account; the other provider's entry stays.
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(core.CACHE_FILE, 'utf8'))), ['same@x.com']);
     assert.equal(core.tokenGet('same@x.com').accessToken, 'claude-token');
     core.tokenDelete('same@x.com');
   });

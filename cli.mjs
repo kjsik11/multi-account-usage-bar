@@ -387,10 +387,10 @@ async function cmdList() {
   }
 }
 
-function cmdRemove() {
+async function cmdRemove() {
   const target = opts.args[0];
   if (!target) fail('usage: usage-bar remove <email|label> [--provider codex]');
-  const entry = core.removeAccount(target, { provider: opts.flags.provider });
+  const entry = await core.removeAccount(target, { provider: opts.flags.provider });
   console.log(`${green('✔')} removed ${providerTag(entry.provider)} ${entry.email}`);
 }
 
